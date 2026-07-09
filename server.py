@@ -5,6 +5,7 @@ Provides MCP tools for interacting with Firebird databases via FastMCP.
 
 import os
 import json
+import hashlib
 import logging
 import datetime
 import decimal
@@ -149,22 +150,24 @@ def get_db_info() -> str:
         return json.dumps({"error": str(exc)})
 
 
+# ── Inspection helpers (cursor-based, so the digest can reuse one connection) ────
+def _list_tables(cur: fdb.Cursor) -> list[dict]:
+    cur.execute("""
+        SELECT RDB$RELATION_NAME, RDB$OWNER_NAME, RDB$DESCRIPTION
+        FROM RDB$RELATIONS
+        WHERE RDB$SYSTEM_FLAG = 0 AND RDB$VIEW_BLR IS NULL
+        ORDER BY RDB$RELATION_NAME
+    """)
+    return [{"table_name": (r[0] or "").strip(),
+             "owner": (r[1] or "").strip(),
+             "description": (r[2] or "").strip()} for r in cur.fetchall()]
+
+
 @mcp.tool(description="List all user tables in the Firebird database with owner and description.")
 def list_tables() -> str:
-    sql = """
-          SELECT RDB$RELATION_NAME, RDB$OWNER_NAME, RDB$DESCRIPTION
-          FROM RDB$RELATIONS
-          WHERE RDB$SYSTEM_FLAG = 0
-            AND RDB$VIEW_BLR IS NULL
-          ORDER BY RDB$RELATION_NAME \
-          """
     try:
         conn = get_connection()
-        cur = conn.cursor()
-        cur.execute(sql)
-        rows = [{"table_name": (r[0] or "").strip(),
-                 "owner": (r[1] or "").strip(),
-                 "description": (r[2] or "").strip()} for r in cur.fetchall()]
+        rows = _list_tables(conn.cursor())
         conn.close()
         return json.dumps(rows, ensure_ascii=False, indent=2)
     except Exception as exc:
@@ -172,10 +175,7 @@ def list_tables() -> str:
         return json.dumps({"error": str(exc)})
 
 
-@mcp.tool(description="Return column definitions, primary key, and indexes for a specific table.")
-def describe_table(table_name: str) -> str:
-    """Args: table_name — name of the table (case-insensitive)."""
-    tbl = table_name.upper().strip()
+def _describe_table(cur: fdb.Cursor, tbl: str) -> dict:
     sql_cols = """
                SELECT RF.RDB$FIELD_NAME,
                       CASE F.RDB$FIELD_TYPE
@@ -221,50 +221,56 @@ def describe_table(table_name: str) -> str:
              WHERE RC.RDB$RELATION_NAME = ?
                AND RC.RDB$CONSTRAINT_TYPE = 'PRIMARY KEY' \
              """
+    cur.execute(sql_cols, [tbl])
+    columns = [{"position": r[8], "name": (r[0] or "").strip(), "type": r[1],
+                "length": r[2], "precision": r[3], "scale": abs(r[4]) if r[4] else 0,
+                "not_null": bool(r[5]), "default": (r[6] or "").strip() or None,
+                "description": (r[7] or "").strip() or None}
+               for r in cur.fetchall()]
+    cur.execute(sql_idx, [tbl])
+    indexes: dict = {}
+    for r in cur.fetchall():
+        n = (r[0] or "").strip()
+        if n not in indexes:
+            indexes[n] = {"name": n, "unique": bool(r[2]),
+                          "type": "DESC" if r[3] else "ASC", "columns": []}
+        indexes[n]["columns"].append((r[1] or "").strip())
+    cur.execute(sql_pk, [tbl])
+    pk = [(r[0] or "").strip() for r in cur.fetchall()]
+    return {"table": tbl, "columns": columns,
+            "primary_key": pk, "indexes": list(indexes.values())}
+
+
+@mcp.tool(description="Return column definitions, primary key, and indexes for a specific table.")
+def describe_table(table_name: str) -> str:
+    """Args: table_name — name of the table (case-insensitive)."""
     try:
         conn = get_connection()
-        cur = conn.cursor()
-        cur.execute(sql_cols, [tbl])
-        columns = [{"position": r[8], "name": (r[0] or "").strip(), "type": r[1],
-                    "length": r[2], "precision": r[3], "scale": abs(r[4]) if r[4] else 0,
-                    "not_null": bool(r[5]), "default": (r[6] or "").strip() or None,
-                    "description": (r[7] or "").strip() or None}
-                   for r in cur.fetchall()]
-        cur.execute(sql_idx, [tbl])
-        indexes: dict = {}
-        for r in cur.fetchall():
-            n = (r[0] or "").strip()
-            if n not in indexes:
-                indexes[n] = {"name": n, "unique": bool(r[2]),
-                              "type": "DESC" if r[3] else "ASC", "columns": []}
-            indexes[n]["columns"].append((r[1] or "").strip())
-        cur.execute(sql_pk, [tbl])
-        pk = [(r[0] or "").strip() for r in cur.fetchall()]
+        result = _describe_table(conn.cursor(), table_name.upper().strip())
         conn.close()
-        return json.dumps({"table": tbl, "columns": columns,
-                           "primary_key": pk, "indexes": list(indexes.values())},
-                          ensure_ascii=False, indent=2)
+        return json.dumps(result, ensure_ascii=False, indent=2)
     except Exception as exc:
         logger.error("describe_table: %s", exc)
         return json.dumps({"error": str(exc)})
 
 
+def _list_views(cur: fdb.Cursor) -> list[dict]:
+    cur.execute("""
+        SELECT RDB$RELATION_NAME, RDB$VIEW_SOURCE, RDB$DESCRIPTION
+        FROM RDB$RELATIONS
+        WHERE RDB$SYSTEM_FLAG = 0 AND RDB$VIEW_BLR IS NOT NULL
+        ORDER BY RDB$RELATION_NAME
+    """)
+    return [{"name": (r[0] or "").strip(),
+             "source": (r[1] or "").strip(),
+             "description": (r[2] or "").strip()} for r in cur.fetchall()]
+
+
 @mcp.tool(description="List all views in the Firebird database with their SQL source.")
 def list_views() -> str:
-    sql = """
-          SELECT RDB$RELATION_NAME, RDB$VIEW_SOURCE, RDB$DESCRIPTION
-          FROM RDB$RELATIONS
-          WHERE RDB$SYSTEM_FLAG = 0
-            AND RDB$VIEW_BLR IS NOT NULL
-          ORDER BY RDB$RELATION_NAME \
-          """
     try:
         conn = get_connection()
-        cur = conn.cursor()
-        cur.execute(sql)
-        rows = [{"name": (r[0] or "").strip(),
-                 "source": (r[1] or "").strip(),
-                 "description": (r[2] or "").strip()} for r in cur.fetchall()]
+        rows = _list_views(conn.cursor())
         conn.close()
         return json.dumps(rows, ensure_ascii=False, indent=2)
     except Exception as exc:
@@ -272,24 +278,24 @@ def list_views() -> str:
         return json.dumps({"error": str(exc)})
 
 
+def _list_procedures(cur: fdb.Cursor) -> list[dict]:
+    cur.execute("""
+        SELECT RDB$PROCEDURE_NAME, RDB$PROCEDURE_INPUTS,
+               RDB$PROCEDURE_OUTPUTS, RDB$DESCRIPTION
+        FROM RDB$PROCEDURES
+        WHERE RDB$SYSTEM_FLAG = 0
+        ORDER BY RDB$PROCEDURE_NAME
+    """)
+    return [{"name": (r[0] or "").strip(), "input_params": r[1] or 0,
+             "output_params": r[2] or 0, "description": (r[3] or "").strip()}
+            for r in cur.fetchall()]
+
+
 @mcp.tool(description="List all stored procedures in the Firebird database.")
 def list_procedures() -> str:
-    sql = """
-          SELECT RDB$PROCEDURE_NAME,
-                 RDB$PROCEDURE_INPUTS,
-                 RDB$PROCEDURE_OUTPUTS,
-                 RDB$DESCRIPTION
-          FROM RDB$PROCEDURES
-          WHERE RDB$SYSTEM_FLAG = 0
-          ORDER BY RDB$PROCEDURE_NAME \
-          """
     try:
         conn = get_connection()
-        cur = conn.cursor()
-        cur.execute(sql)
-        rows = [{"name": (r[0] or "").strip(), "input_params": r[1] or 0,
-                 "output_params": r[2] or 0, "description": (r[3] or "").strip()}
-                for r in cur.fetchall()]
+        rows = _list_procedures(conn.cursor())
         conn.close()
         return json.dumps(rows, ensure_ascii=False, indent=2)
     except Exception as exc:
@@ -297,10 +303,7 @@ def list_procedures() -> str:
         return json.dumps({"error": str(exc)})
 
 
-@mcp.tool(description="Return the source code and parameter definitions of a stored procedure.")
-def get_procedure_source(procedure_name: str) -> str:
-    """Args: procedure_name — name of the procedure (case-insensitive)."""
-    name = procedure_name.upper().strip()
+def _get_procedure_source(cur: fdb.Cursor, name: str) -> dict:
     sql_src = "SELECT RDB$PROCEDURE_SOURCE FROM RDB$PROCEDURES WHERE RDB$PROCEDURE_NAME=?"
     sql_params = """
                  SELECT PP.RDB$PARAMETER_NAME,
@@ -323,23 +326,100 @@ def get_procedure_source(procedure_name: str) -> str:
                  WHERE PP.RDB$PROCEDURE_NAME = ?
                  ORDER BY PP.RDB$PARAMETER_TYPE, PP.RDB$PARAMETER_NUMBER \
                  """
+    cur.execute(sql_src, [name])
+    row = cur.fetchone()
+    source = (row[0] or "").strip() if row else ""
+    cur.execute(sql_params, [name])
+    inputs, outputs = [], []
+    for r in cur.fetchall():
+        p = {"name": (r[0] or "").strip(), "type": r[2], "length": r[3]}
+        (inputs if r[1] == 0 else outputs).append(p)
+    return {"procedure": name, "source": source, "inputs": inputs, "outputs": outputs}
+
+
+@mcp.tool(description="Return the source code and parameter definitions of a stored procedure.")
+def get_procedure_source(procedure_name: str) -> str:
+    """Args: procedure_name — name of the procedure (case-insensitive)."""
+    try:
+        conn = get_connection()
+        result = _get_procedure_source(conn.cursor(), procedure_name.upper().strip())
+        conn.close()
+        return json.dumps(result, ensure_ascii=False, indent=2)
+    except Exception as exc:
+        logger.error("get_procedure_source: %s", exc)
+        return json.dumps({"error": str(exc)})
+
+
+def _schema_fingerprint(cur: fdb.Cursor) -> str:
+    """Short hash of schema metadata. Computed in Python so it works on FB 2.5–5.0
+    (no dependency on LIST()/HASH() built-ins). RDB$FORMAT bumps on every ALTER TABLE,
+    so combined with object names it changes whenever the schema does."""
+    cur.execute("""
+        SELECT TRIM(RDB$RELATION_NAME), COALESCE(RDB$FORMAT, 0)
+        FROM RDB$RELATIONS WHERE RDB$SYSTEM_FLAG = 0
+        ORDER BY RDB$RELATION_NAME
+    """)
+    rels = "|".join(f"{r[0]}:{r[1]}" for r in cur.fetchall())
+    cur.execute("""
+        SELECT TRIM(RDB$PROCEDURE_NAME)
+        FROM RDB$PROCEDURES WHERE RDB$SYSTEM_FLAG = 0
+        ORDER BY RDB$PROCEDURE_NAME
+    """)
+    procs = "|".join((r[0] or "") for r in cur.fetchall())
+    return hashlib.sha256(f"{rels}#{procs}".encode("utf-8")).hexdigest()[:16]
+
+
+@mcp.tool(description=(
+    "Return a short fingerprint (hash) of the database schema in one cheap query. "
+    "Cache it, then compare on the next session: if it is unchanged, a previously "
+    "saved get_schema_digest output is still valid and the DB need not be re-read."
+))
+def get_schema_fingerprint() -> str:
+    try:
+        conn = get_connection()
+        fp = _schema_fingerprint(conn.cursor())
+        conn.close()
+        return json.dumps({"fingerprint": fp})
+    except Exception as exc:
+        logger.error("get_schema_fingerprint: %s", exc)
+        return json.dumps({"error": str(exc)})
+
+
+@mcp.tool(description=(
+    "Return the full database schema in a single call: every table with columns, "
+    "primary key and indexes, all views, and procedure signatures. Includes a "
+    "'fingerprint' field. Intended to be fetched once, saved to the project "
+    "(e.g. a committed db_schema.json / CLAUDE.md), and reused across sessions; "
+    "re-fetch only when get_schema_fingerprint changes. Set include_procedure_source "
+    "to also embed full stored-procedure bodies (larger output)."
+))
+def get_schema_digest(include_procedure_source: bool = False) -> str:
+    """Args: include_procedure_source — embed full procedure bodies (default False)."""
+    conn = None
     try:
         conn = get_connection()
         cur = conn.cursor()
-        cur.execute(sql_src, [name])
-        row = cur.fetchone()
-        source = (row[0] or "").strip() if row else ""
-        cur.execute(sql_params, [name])
-        inputs, outputs = [], []
-        for r in cur.fetchall():
-            p = {"name": (r[0] or "").strip(), "type": r[2], "length": r[3]}
-            (inputs if r[1] == 0 else outputs).append(p)
+        tables = _list_tables(cur)
+        procedures = _list_procedures(cur)
+        schema: dict[str, Any] = {
+            "tables": [_describe_table(cur, t["table_name"]) for t in tables],
+            "views": _list_views(cur),
+            "procedures": procedures,
+        }
+        if include_procedure_source:
+            schema["procedure_source"] = [
+                _get_procedure_source(cur, p["name"]) for p in procedures
+            ]
+        schema["fingerprint"] = _schema_fingerprint(cur)
         conn.close()
-        return json.dumps({"procedure": name, "source": source,
-                           "inputs": inputs, "outputs": outputs},
-                          ensure_ascii=False, indent=2)
+        return json.dumps(schema, ensure_ascii=False, indent=2)
     except Exception as exc:
-        logger.error("get_procedure_source: %s", exc)
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+        logger.error("get_schema_digest: %s", exc)
         return json.dumps({"error": str(exc)})
 
 
